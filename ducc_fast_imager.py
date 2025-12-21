@@ -7,6 +7,9 @@ from tqdm import tqdm
 import numpy as np
 import astropy.constants as const
 import astropy.units as u
+import matplotlib.pyplot as plt
+from scipy.ndimage import maximum_filter
+
 from casacore.tables import table
 from typing import Iterable, Tuple, List, Dict, Any, Optional
 
@@ -249,6 +252,9 @@ def image_time_samples(
         if chan_freq.shape[0] != vis.shape[1]:
             raise ValueError('Channel count mismatch between CHAN_FREQ and VIS')
 
+        #print(np.max(wgt_2d), np.median(wgt_2d), np.min(wgt_2d))
+        wgt_2d /= np.max(wgt_2d)
+        
         dirty = ducc0.wgridder.vis2dirty(
             uvw=uvw,
             freq=chan_freq,
@@ -273,10 +279,22 @@ def image_time_samples(
             allow_nshift=allow_nshift,
             double_precision_accumulation=double_precision_accumulation,
         )
+
+
+        n_valid = int(np.count_nonzero(wgt_2d)) #np.sum(wgt_2d/np.max(wgt_2d)) #
+        if n_valid > 0:
+            #I think divide_by_n should be dealing with this already but whatever
+            dirty = dirty / n_valid
+
         
-        if t_chunk_idx == 10:
-            print("adding fake transient")
-            dirty[198:202,198:202] = 100.0
+        # if t_chunk_idx == 10:
+        #     print("adding fake transient")
+        #     #dirty[198:202,198:202] = 100.0
+        #     import matplotlib.pyplot as plt
+        #     plt.imshow(dirty, aspect='auto', interpolation='none', origin='lower', cmap='gray')
+        #     plt.colorbar()
+        #     plt.savefig(f'img_{cube_idx:04d}.png', dpi=300)
+        #     plt.close()
             
         cube[cube_idx, :, :] = dirty
         cube_idx += 1
@@ -284,9 +302,10 @@ def image_time_samples(
         if do_plot:
             import matplotlib.pyplot as plt
             plt.imshow(dirty, aspect='auto', interpolation='none', origin='lower', cmap='gray')
+            plt.colorbar()            
             plt.savefig(f"img_{cube_idx:04d}.png", dpi=300)
             sys.exit()
-            plt.show()
+            #plt.show()
         #results.append((time_val, dirty))
         
     #it.close()
@@ -294,6 +313,7 @@ def image_time_samples(
     
     results = (times, cube)    
     return results
+
 
 
 def boxcar_search_time(
@@ -411,10 +431,10 @@ def boxcar_search_time(
         if w > T:
             continue
 
-        # Windowed sums (this already includes sqrt(w) scale if noise is white)
+        # Windowed sums (this already includes sqrt(w) scaling)
         S = moving_sum(w)  # (T_eff, Ny, Nx)
         T_eff = S.shape[0]
-
+        
         if std_mode == "spatial_per_window":
             if spatial_estimator == "mad":
                 sigma_w = spatial_std_mad(S, mask3)             # (T_eff,)
@@ -445,7 +465,7 @@ def boxcar_search_time(
         # Respect valid_mask (optional extra gating)
         if valid_mask is not None:
             snr = np.where(mask3, snr, 0.0)
-
+            
         # Optionally return SNR cube
         if return_snr_cubes:
             snr_cubes[w] = snr.astype(np.float32, copy=False)  # (T_eff, Ny, Nx)
@@ -466,24 +486,261 @@ def boxcar_search_time(
             t0_idx, ys, xs, centers = t0_idx[sel], ys[sel], xs[sel], centers[sel]
 
         # Append
-
         for i in range(t0_idx.size):
+            t0 = int(t0_idx[i])
+            t1 = t0 + w                          # exclusive upper bound (safe: t1 <= T)
+            # Window times
+            time_start = float(times[t0])
+            time_end   = float(times[t1 - 1])
+            
+            # Robust center time: midpoint of start/end (works for non-uniform sampling and even/odd w)
+            time_center = 0.5 * (time_start + time_end)
+            
+            # Nearest index to time_center, but constrained to [t0, t1-1]
+            # (searchsorted on the window slice avoids off-by-one outside the window)
+            k = np.searchsorted(times[t0:t1], time_center)
+            if k == 0:
+                center_idx = t0
+            elif k >= (t1 - t0):
+                center_idx = t1 - 1
+            else:
+                left  = t0 + (k - 1)
+                right = t0 + k
+                center_idx = left if abs(times[left] - time_center) <= abs(times[right] - time_center) else right
+                
             det = {
-                "time_center": float(centers[i]),
+                "time_start":  time_start,
+                "time_end":    time_end,
+                "time_center": float(time_center),
+                "t0_idx":      t0,
+                "t1_idx_excl": t1,
+                "center_idx":  int(center_idx),                
                 "y": int(ys[i]),
                 "x": int(xs[i]),
                 "width_samples": int(w),
-                "snr": float(snr[t0_idx[i], ys[i], xs[i]]),
-                "value_sum": float(S[t0_idx[i], ys[i], xs[i]]) if std_mode == "spatial_per_window" else float(s[t0_idx[i], ys[i], xs[i]]),
-                # NEW: indices (helps snippet extraction)
-                "t0_idx": int(t0_idx[i]),                       # window start index
-                "center_idx": int(t0_idx[i] + (w // 2)),        # center index in time axis
+                "snr": float(snr[t0, ys[i], xs[i]]),
+                "value_sum": float(S[t0, ys[i], xs[i]]) if std_mode == "spatial_per_window" else float(s[t0, ys[i], xs[i]]),
             }
+            
             detections.append(det)
+            
             
     return detections, snr_cubes
 
 
+def nms_snr_maps_per_width(snr_cubes: Dict[int, np.ndarray],  # width_samples -> SNR cube (T_eff, Ny, Nx),
+                       times: np.ndarray,                 # shape (T,)
+                       *,
+                       threshold_sigma: float = 5.0,
+                       spatial_radius: int = 3,           # suppress neighbors within +/-spatial_radius px
+                       time_radius: int = 0,              # optional temporal NMS (suppress across +/- time_radius windows)
+                       valid_mask: Optional[np.ndarray] = None  # (Ny, Nx) pixels to allow; others ignored
+                       ) -> Dict[int, List[Dict[str, Any]]]:
+    """
+    Run spatial (and optional temporal) NMS on each width's SNR cube, returning
+    a list of detection dicts per width. Each detection contains robust time indices.
+    
+    Returns:
+    detections_by_width: {width: [ { 'y','x','snr','t0_idx','t1_idx_excl','center_idx',
+                                        'time_start','time_end','time_center','width_samples' }, ... ] }
+    """
+
+    detections_by_width: Dict[int, List[Dict[str, Any]]] = {}
+
+    # Validate masks
+    for w, snr_w in snr_cubes.items():
+        T_eff, Ny, Nx = snr_w.shape
+        if valid_mask is not None:
+            if valid_mask.shape != (Ny, Nx):
+                raise ValueError("valid_mask must match (Ny, Nx) of SNR cubes")
+        detections: List[Dict[str, Any]] = []
+
+        # Temporal occupancy masks (optional)
+        occ_time: Dict[int, np.ndarray] = {}
+        if time_radius > 0:
+            for t0 in range(T_eff):
+                occ_time[t0] = np.ones((Ny, Nx), dtype=bool)
+
+        for t0 in range(T_eff):
+            snr_slice = snr_w[t0].copy()
+
+            # Apply mask and threshold first
+            if valid_mask is not None:
+                snr_slice = np.where(valid_mask, snr_slice, -np.inf)
+
+            # Optional temporal NMS: suppress around accepted peaks in nearby time windows
+            if time_radius > 0:
+                # Combine occupancy from neighboring times into a single gate
+                for dt in range(-time_radius, time_radius + 1):
+                    t2 = t0 + dt
+                    if 0 <= t2 < T_eff:
+                        snr_slice = np.where(occ_time[t2], snr_slice, -np.inf)
+
+            # Threshold
+            snr_slice = np.where(snr_slice >= threshold_sigma, snr_slice, -np.inf)
+            if not np.isfinite(snr_slice).any():
+                continue
+
+            # Local maxima mask
+            local_max = maximum_filter(snr_slice, size=2*spatial_radius+1, mode='nearest')
+            peaks_mask = snr_slice >= local_max
+            
+            ys, xs = np.where(peaks_mask & np.isfinite(snr_slice))
+            if ys.size == 0:
+                continue
+
+            # Sort peaks by SNR descending
+            snr_vals = snr_slice[ys, xs]
+            order = np.argsort(snr_vals)[::-1]
+            ys, xs, snr_vals = ys[order], xs[order], snr_vals[order]
+
+            # Accept peaks, suppress neighbors in current (and optionally nearby) time slices
+            for y, x, s in zip(ys, xs, snr_vals):
+                # Neighborhood to suppress
+                y0 = max(0, y - spatial_radius)
+                y1 = min(Ny, y + spatial_radius + 1)
+                x0 = max(0, x - spatial_radius)
+                x1 = min(Nx, x + spatial_radius + 1)
+
+                # Compute robust time indices and times for this width/window
+                t1 = t0 + w           # exclusive bound
+                time_start = float(times[t0])
+                time_end   = float(times[t1 - 1])
+                time_center = 0.5 * (time_start + time_end)
+
+                # Nearest center index inside [t0, t1-1]
+                k = np.searchsorted(times[t0:t1], time_center)
+                if k == 0:
+                    center_idx = t0
+                elif k >= (t1 - t0):
+                    center_idx = t1 - 1
+                else:
+                    left  = t0 + (k - 1)
+                    right = t0 + k
+                    center_idx = left if abs(times[left] - time_center) <= abs(times[right] - time_center) else right
+
+                det = {
+                    "y": int(y),
+                    "x": int(x),
+                    "snr": float(s),
+                    "width_samples": int(w),
+                    "t0_idx": int(t0),
+                    "t1_idx_excl": int(t1),
+                    "center_idx": int(center_idx),
+                    "time_start": time_start,
+                    "time_end": time_end,
+                    "time_center": float(time_center),
+                }
+                detections.append(det)
+
+                # Suppress neighborhood in current time
+                snr_w[t0, y0:y1, x0:x1] = -np.inf
+                if time_radius > 0:
+                    # Suppress the same neighborhood in nearby times (spatio-temporal NMS)
+                    for dt in range(-time_radius, time_radius + 1):
+                        t2 = t0 + dt
+                        if 0 <= t2 < T_eff:
+                            snr_w[t2, y0:y1, x0:x1] = -np.inf
+                            occ_time[t2][y0:y1, x0:x1] = False
+
+        detections_by_width[w] = detections
+
+    return detections_by_width
+
+def group_filter_across_widths(
+        detections_by_width: Dict[int, List[Dict[str, Any]]],
+        times: np.ndarray,
+        *,
+        spatial_radius: int = 3,
+        time_radius: int = 0,
+        policy: str = "max_snr",
+        max_per_time_group: Optional[int] = None,
+        ny_nx: Optional[Tuple[int, int]] = None,
+) -> List[Dict[str, Any]]:
+
+
+
+        # Flatten by time center
+    by_time: Dict[int, List[Dict[str, Any]]] = {}
+    for w, dets in detections_by_width.items():
+        for d in dets:
+            ci = int(d["center_idx"])
+            by_time.setdefault(ci, []).append(d)
+
+    # If temporal NMS is requested, prepare a global occupancy structure keyed by center_idx
+    occ_by_center: Dict[int, np.ndarray] = {}
+
+    # If Ny,Nx not provided, infer from detections
+    if ny_nx is None:
+        max_y = -1
+        max_x = -1
+        for dets in by_time.values():
+            for d in dets:
+                if d["y"] > max_y: max_y = d["y"]
+                if d["x"] > max_x: max_x = d["x"]
+        Ny = max_y + 1 if max_y >= 0 else 1
+        Nx = max_x + 1 if max_x >= 0 else 1
+    else:
+        Ny, Nx = ny_nx
+
+    final: List[Dict[str, Any]] = []
+
+    # Helper to get sorted order per policy
+    def sort_dets(dets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if policy == "max_snr":
+            return sorted(dets, key=lambda d: d["snr"], reverse=True)
+        elif policy == "prefer_short":
+            return sorted(dets, key=lambda d: (d["width_samples"], -d["snr"]))
+        elif policy == "prefer_long":
+            return sorted(dets, key=lambda d: (-d["width_samples"], -d["snr"]))
+        else:
+            raise ValueError(f"Unknown policy='{policy}'")
+
+    # Process each time-center group independently
+    for center_idx, dets in by_time.items():
+        if len(dets) == 0:
+            continue
+
+        # Initialize occupancy for this time center if needed
+        if center_idx not in occ_by_center:
+            occ_by_center[center_idx] = np.ones((Ny, Nx), dtype=bool)
+
+        # Sort by policy
+        dets_sorted = sort_dets(dets)
+
+        kept = 0
+        for d in dets_sorted:
+            y = int(d["y"]); x = int(d["x"])
+            # If spatial spot already suppressed for this center, skip
+            if not occ_by_center[center_idx][y, x]:
+                continue
+
+            # Accept detection
+            final.append(d)
+
+            # Suppress neighborhood for this center
+            y0 = max(0, y - spatial_radius)
+            y1 = min(Ny, y + spatial_radius + 1)
+            x0 = max(0, x - spatial_radius)
+            x1 = min(Nx, x + spatial_radius + 1)
+            occ_by_center[center_idx][y0:y1, x0:x1] = False
+
+            # Optional temporal NMS: suppress the same spatial neighborhood in nearby center_idx groups
+            if time_radius > 0:
+                for dt in range(-time_radius, time_radius + 1):
+                    ci2 = center_idx + dt
+                    if ci2 == center_idx:
+                        continue
+                    if ci2 in by_time:
+                        if ci2 not in occ_by_center:
+                            occ_by_center[ci2] = np.ones((Ny, Nx), dtype=bool)
+                        occ_by_center[ci2][y0:y1, x0:x1] = False
+
+            kept += 1
+            if (max_per_time_group is not None) and (kept >= max_per_time_group):
+                break
+
+    return final
 
 def extract_candidate_snippets(
     times: np.ndarray,
@@ -508,7 +765,7 @@ def extract_candidate_snippets(
     half_sp = spatial_size // 2
     out: List[Dict[str, Any]] = []
 
-    # Helper: find center time index robustly
+    # find center time index robustly
     def _resolve_center_idx(det: Dict[str, Any]) -> int:
         if "center_idx" in det:
             return int(det["center_idx"])
@@ -678,7 +935,7 @@ def main():
 
         print(len(times), cube.shape)
         detections, snr_cubes = boxcar_search_time(times, cube,
-                                                   widths=[1], #, 2, 4, 8, 16, 32, 64, 128],
+                                                   widths=[1, 2, 4, 8, 16, 32, 64],
                                                    widths_in_seconds=False,      # set True if widths are in seconds
                                                    threshold_sigma=7.5,
                                                    return_snr_cubes=True,
@@ -687,30 +944,51 @@ def main():
                                                    subtract_mean_per_pixel=True  # high-pass in time per pixel
                                                    )
 
-
+        # 1) NMS per width (spatial, optional temporal)
+        detections_by_width = nms_snr_maps_per_width(
+            snr_cubes, times,
+            threshold_sigma=7.5,
+            spatial_radius=2,
+            time_radius=0,          # set >0 to suppress across neighboring time slices too
+            valid_mask=None
+        )
         
-        print(f"chunk start:{start} end:{end}: Found {len(detections)} candidates")
-
-        
-        snippets = extract_candidate_snippets(
-            times, cube, detections,
-            spatial_size=50,
-            time_factor=5,
-            pad_mode="constant",   # or "edge"
-            pad_value=0.0,
-            return_indices=True
+        # 2) Merge across widths and apply cross-width NMS
+        final_detections = group_filter_across_widths(
+            detections_by_width, times,
+            spatial_radius=2,
+            time_radius=0,          # set >0 to suppress across nearby center_idx groups
+            policy="max_snr",       # or "prefer_short"/"prefer_long"
+            max_per_time_group=1,   # keep only 1 per time center (typical)
+            ny_nx=(cube.shape[1], cube.shape[2])  # pass explicit Ny,Nx for speed
         )
 
-        print(f"Prepared {len(snippets)} snippets.")
-        # For the first snippet:
-        first = snippets[0]
-        print("Candidate:", first["candidate"])
-        print("Snippet cube shape:", first["snippet_cube"].shape)      # (5*w, 50, 50)
 
-        plt.imshow(first["snippet_cube"][first["snippet_cube"].shape[0]//2 +1, :, :], aspect='auto', origin='lower')
-        plt.savefig("test_snippet.png", dpi=300)
-        print("Snippet times shape:", first["snippet_times"].shape)    # (5*w,)
-        print("Meta:", first["meta"])
+        
+        print(f"chunk start:{start} end:{end}: Found {len(final_detections)} candidates")
+
+        if len(final_detections) > 0:
+            snippets = extract_candidate_snippets(
+                times, cube, final_detections,
+                spatial_size=50,
+                time_factor=5,
+                pad_mode="constant",   # or "edge"
+                pad_value=0.0,
+                return_indices=True
+            )
+            #import ipdb; ipdb.set_trace()
+            print(f"Prepared {len(snippets)} snippets.")
+            # For the first snippet:
+            first = snippets[0]
+            print("Candidate:", first["candidate"])
+            print("Snippet cube shape:", first["snippet_cube"].shape)      # (5*w, 50, 50)
+            
+            plt.imshow(first["snippet_cube"][first["snippet_cube"].shape[0]//2 +1, :, :], aspect='auto', origin='lower')
+            plt.savefig("test_snippet.png", dpi=300)
+            print("Snippet times shape:", first["snippet_times"].shape)    # (5*w,)
+            print("Meta:", first["meta"])
+
+        
         
         start = end + 1
         chunk_id += 1
