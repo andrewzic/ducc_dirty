@@ -1,11 +1,11 @@
 # ducc_dirty
 
 ## installation
-
+```
 git clone https://github.com/andrewzic/fastducc.git
 cd fastducc
 pip install -e .
-
+```
 ## usage
 ``` 
 > fastducc -h
