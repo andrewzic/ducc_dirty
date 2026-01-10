@@ -98,3 +98,28 @@ def get_phase_center(msname: str, field_name: str | None = None):
     ra0_rad  = float(phase_dir[idx][ 0, 0])
     dec0_rad = float(phase_dir[idx][ 0, 1])  #phase_dir[idx]: [[-1.67134852 -0.41158857]]
     return ra0_rad, dec0_rad, str(names[idx])
+
+# --- 3) MS open & chunk count ---
+def open_ms(msname: str):
+    t_main = table(msname, readonly=True)
+    colnames = set(t_main.colnames())
+    time_col = 'TIME_CENTROID' if 'TIME_CENTROID' in colnames else 'TIME'
+    it = t_main.iter([time_col], sort=True)
+    total_chunks = sum(1 for _ in it)
+    return t_main, total_chunks, time_col
+
+
+def derive_paths(msname: str):
+    ms_path = os.path.abspath(msname.rstrip('/'))
+    ms_dir  = os.path.dirname(ms_path)
+    ms_tag  = os.path.basename(ms_path)
+    ms_base = ms_tag[:-3] if ms_tag.endswith('.ms') else ms_tag
+    candidates_dir = os.path.join(ms_dir, "candidates")
+    os.makedirs(candidates_dir, exist_ok=True)
+
+    def chunk_prefix_root(start_idx: int) -> str:
+        return os.path.join(candidates_dir, f"{ms_base}_chunk_{start_idx:06d}")
+
+    all_prefix_root = os.path.join(candidates_dir, f"{ms_base}_all")
+
+    return ms_base, candidates_dir, chunk_prefix_root, all_prefix_root

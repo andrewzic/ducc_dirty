@@ -77,7 +77,7 @@ def make_stdmap_snippet(
                              "clipped": (y0, y1), "pad": (pad_y_top, pad_y_bot)},
             "x_indices":    {"desired": (x - half_sp, x - half_sp + spatial_size),
                              "clipped": (x0, x1), "pad": (pad_x_left, pad_x_right)},
-            "center_idx": None,
+            "center_idx": 0,
             "snippet_shape": (1, spatial_size, spatial_size),
         }
     }

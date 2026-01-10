@@ -14,6 +14,7 @@ Submodules:
 - wcs: sky projection/WCS utilities
 - candidates: snippet extraction & packaging of candidate cutouts
 - ducc_continuum_img: auxiliary continuum imaging tool
+- types: type definitions for dataclasses
 """
 
 __all__ = [
@@ -25,6 +26,7 @@ __all__ = [
     "ms_utils",
     "wcs",
     "candidates",
+    "types"
 ]
 
 __version__ = "0.1.0"

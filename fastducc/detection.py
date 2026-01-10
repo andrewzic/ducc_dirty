@@ -408,7 +408,7 @@ def variance_search_welford(
 
     # --- SNR map: mean-subtracted or direct ratio ---
     if subtract_mean_of_std_map:
-        mu = np.nanmean(std_map64[valid_mask])
+        mu = np.nanmean(std_map64)
         snr = (std_map64 - mu) / spatial_sigma
     else:
         snr = std_map64 / spatial_sigma
@@ -441,10 +441,10 @@ def variance_search_welford(
             "snr": float(s),
             "std": float(std_map64[y, x]),
             # placeholders to satisfy downstream code
-            "time_start": None,
-            "time_end": None,
-            "time_center": None,
-            "center_idx": None,
+            "time_start": 0,
+            "time_end": 0,
+            "time_center": 0,
+            "center_idx": 0,
             "width_samples": 1,
         }
         detections.append(det)
